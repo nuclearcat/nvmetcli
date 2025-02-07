@@ -4,6 +4,7 @@ import os, json
 from flask import Flask, request
 from flask_restful import abort, Api, Resource
 import nvmet as nvme
+import sys
 
 app = Flask(__name__)
 api = Api(app)
@@ -600,4 +601,9 @@ api.add_resource(SubsystemNamespaceANAGroups, f'{NVMET_PREFIX}/subsystems/<nqn>/
 api.add_resource(SubsystemNamespaceANAGroup, f'{NVMET_PREFIX}/subsystems/<nqn>/namespaces/<nsid>/ana_<attr>')
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    if len(sys.argv) > 1:
+        app.run(host=sys.argv[1], debug=True)
+    else:
+        print("Warning: No IP address specified, using localhost")
+        print("Usage: nvmetapi.py <ip_address> if not localhost")
+        app.run(debug=True)
