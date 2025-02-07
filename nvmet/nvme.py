@@ -1,5 +1,5 @@
 '''
-Implements access to the NVMe target configfs hierarchy
+Implements access to the NVMe target hierarchy
 
 Copyright (c) 2011-2013 by Datera, Inc.
 Copyright (c) 2011-2014 by Red Hat, Inc.
@@ -22,37 +22,27 @@ import os
 import stat
 import uuid
 import json
-from glob import iglob as glob
 from six import iteritems, moves
+from .error import CFSError, CFSNotFound
+from .fs import Filesystem
+from .rpc import RESTapi
 
 DEFAULT_SAVE_FILE = '/etc/nvmet/config.json'
 
 
-class CFSError(Exception):
-    '''
-    Generic slib error.
-    '''
-    pass
-
-
-class CFSNotFound(CFSError):
-    '''
-    The underlying configfs object does not exist. Happens when
-    calling methods of an object that is instantiated but have
-    been deleted from configfs, or when trying to lookup an
-    object that does not exist.
-    '''
-    pass
-
-
 class CFSNode(object):
 
-    configfs_dir = '/sys/kernel/config/nvmet'
+    nvmet_prefix = '/nvmet'
 
     def __init__(self):
-        self._path = self.configfs_dir
+        self._path = self.nvmet_prefix
         self._enable = None
         self.attr_groups = []
+        if 'NVMET_URI' in os.environ:
+            uri = os.environ['NVMET_URI']
+            self.cfg = RESTapi(uri)
+        else:
+            self.cfg = Filesystem()
 
     def __eq__(self, other):
         return self._path == other._path
@@ -65,7 +55,7 @@ class CFSNode(object):
 
     def _create_in_cfs(self, mode):
         '''
-        Creates the configFS node if it does not already exist, depending on
+        Creates the node if it does not already exist, depending on
         the mode.
         any -> makes sure it exists, also works if the node already does exist
         lookup -> make sure it does NOT exist
@@ -74,26 +64,26 @@ class CFSNode(object):
         if mode not in ['any', 'lookup', 'create']:
             raise CFSError("Invalid mode: %s" % mode)
         if self.exists and mode == 'create':
-            raise CFSError("This %s already exists in configFS" %
+            raise CFSError("This %s already exists" %
                            self.__class__.__name__)
         elif not self.exists and mode == 'lookup':
-            raise CFSNotFound("No such %s in configfs: %s" %
-                              (self.__class__.__name__, self.path))
+            raise CFSNotFound("No such %s: %s" %
+                              (self.__class__.__name__, self._path))
 
         if not self.exists:
             try:
-                os.mkdir(self.path)
+                self.cfg.create(self._path)
             except:
-                raise CFSError("Could not create %s in configFS" %
+                raise CFSError("Could not create %s" %
                                self.__class__.__name__)
         self.get_enable()
 
     def _exists(self):
-        return os.path.isdir(self.path)
+        return self.cfg.test(self._path)
 
     def _check_self(self):
         if not self.exists:
-            raise CFSNotFound("This %s does not exist in configFS" %
+            raise CFSNotFound("This %s does not exist" %
                               self.__class__.__name__)
 
     def list_attrs(self, group, writable=None):
@@ -107,9 +97,7 @@ class CFSNode(object):
         '''
         self._check_self()
 
-        names = [os.path.basename(name).split('_', 1)[1]
-                 for name in glob("%s/%s_*" % (self._path, group))
-                     if os.path.isfile(name)]
+        names = self.cfg.attr_names(self._path, group)
 
         if writable is True:
             names = [name for name in names
@@ -122,33 +110,25 @@ class CFSNode(object):
         return names
 
     def _attr_is_writable(self, group, name):
-        s = os.stat("%s/%s_%s" % (self._path, group, name))
-        return s[stat.ST_MODE] & stat.S_IWUSR
+        return self.cfg.test_writable(f'{self._path}/{group}_{name}')
 
     def set_attr(self, group, attribute, value):
         '''
         Sets the value of a named attribute.
-        The attribute must exist in configFS.
+        The attribute must exist.
         @param group: The attribute group
         @param attribute: The attribute's name.
         @param value: The attribute's value.
         @type value: string
         '''
         self._check_self()
-        path = "%s/%s_%s" % (self.path, str(group), str(attribute))
-
-        if not os.path.isfile(path):
-            raise CFSError("Cannot find attribute: %s" % path)
+        path = "%s/%s_%s" % (self._path, str(group), str(attribute))
 
         if self._enable:
             raise CFSError("Cannot set attribute while %s is enabled" %
                            self.__class__.__name__)
 
-        try:
-            with open(path, 'w') as file_fd:
-                file_fd.write(str(value))
-        except Exception as e:
-            raise CFSError("Cannot set attribute %s: %s" % (path, e))
+        self.cfg.modify(path, value)
 
     def get_attr(self, group, attribute):
         '''
@@ -158,52 +138,41 @@ class CFSNode(object):
         @return: The named attribute's value, as a string.
         '''
         self._check_self()
-        path = "%s/%s_%s" % (self.path, str(group), str(attribute))
-        if not os.path.isfile(path):
-            raise CFSError("Cannot find attribute: %s" % path)
-
-        with open(path, 'r') as file_fd:
-            return file_fd.read().strip()
+        path = "%s/%s_%s" % (self._path, str(group), str(attribute))
+        return self.cfg.fetch(path)
 
     def get_enable(self):
         self._check_self()
-        path = "%s/enable" % self.path
-        if not os.path.isfile(path):
-            return None
+        path = "%s/enable" % self._path
 
-        with open(path, 'r') as file_fd:
-            self._enable = int(file_fd.read().strip())
+        try:
+            self._enable = int(self.cfg.fetch(path))
+        except CFSNotFound:
+            return None
         return self._enable
 
     def set_enable(self, value):
         self._check_self()
-        path = "%s/enable" % self.path
+        path = "%s/enable" % self._path
 
-        if not os.path.isfile(path) or self._enable is None:
-            raise CFSError("Cannot enable %s" % self.path)
+        if self._enable is None:
+            raise CFSError("Cannot enable %s" % self._path)
 
-        try:
-            with open(path, 'w') as file_fd:
-                file_fd.write(str(value))
-        except Exception as e:
-            raise CFSError("Cannot enable %s: %s (%s)" %
-                           (self.path, e, value))
+        self.cfg.modify(path, str(value))
         self._enable = value
 
     def delete(self):
         '''
-        If the underlying configFS object does not exist, this method does
-        nothing. If the underlying configFS object exists, this method attempts
-        to delete it.
+        If the underlying object does not exist, this method does nothing.
+        If the underlying object exists, this method attempts to delete it.
         '''
-        if self.exists:
-            os.rmdir(self.path)
+        self.cfg.remove(self._path)
 
     path = property(_get_path,
-                    doc="Get the configFS object path.")
+                    doc="Get the full object path.")
     exists = property(_exists,
-            doc="Is True as long as the underlying configFS object exists. "
-                      + "If the underlying configFS objects gets deleted "
+            doc="Is True as long as the underlying object exists. "
+                      + "If the underlying objects gets deleted "
                       + "either by calling the delete() method, or by any "
                       + "other means, it will be False.")
 
@@ -234,14 +203,14 @@ class Root(CFSNode):
     def __init__(self):
         super(Root, self).__init__()
 
-        if not os.path.isdir(self.configfs_dir):
+        if not self.cfg.test(self.nvmet_prefix):
             self._modprobe('nvmet')
 
-        if not os.path.isdir(self.configfs_dir):
+        if not self.cfg.test(self.nvmet_prefix):
             raise CFSError("%s does not exist.  Giving up." %
-                           self.configfs_dir)
+                           self.nvmet_prefix)
 
-        self._path = self.configfs_dir
+        self._path = self.nvmet_prefix
         self._create_in_cfs('lookup')
 
     def _modprobe(self, modname):
@@ -263,7 +232,7 @@ class Root(CFSNode):
     def _list_subsystems(self):
         self._check_self()
 
-        for d in os.listdir("%s/subsystems/" % self._path):
+        for d in self.cfg.namelist(self._path, 'subsystems'):
             yield Subsystem(d, 'lookup')
 
     subsystems = property(_list_subsystems,
@@ -272,7 +241,7 @@ class Root(CFSNode):
     def _list_ports(self):
         self._check_self()
 
-        for d in os.listdir("%s/ports/" % self._path):
+        for d in self.cfg.namelist(self._path, 'ports'):
             yield Port(d, 'lookup')
 
     ports = property(_list_ports,
@@ -281,7 +250,7 @@ class Root(CFSNode):
     def _list_hosts(self):
         self._check_self()
 
-        for h in os.listdir("%s/hosts/" % self._path):
+        for h in self.cfg.namelist(self._path, 'hosts'):
             yield Host(h, 'lookup')
 
     hosts = property(_list_hosts,
@@ -404,7 +373,7 @@ class Root(CFSNode):
 
 class Subsystem(CFSNode):
     '''
-    This is an interface to a NVMe Subsystem in configFS.
+    This is an interface to a NVMe Subsystem.
     A Subsystem is identified by its NQN.
     '''
 
@@ -417,10 +386,10 @@ class Subsystem(CFSNode):
             If no NQN is specified, one will be generated.
         @type nqn: string
         @param mode:An optional string containing the object creation mode:
-            - I{'any'} means the configFS object will be either looked up
+            - I{'any'} means the object will be either looked up
               or created.
-            - I{'lookup'} means the object MUST already exist configFS.
-            - I{'create'} means the object must NOT already exist in configFS.
+            - I{'lookup'} means the object MUST already exist.
+            - I{'create'} means the object must NOT already exist.
         @type mode:string
         @return: A Subsystem object.
         '''
@@ -433,7 +402,7 @@ class Subsystem(CFSNode):
 
         self.nqn = nqn
         self.attr_groups = ['attr']
-        self._path = "%s/subsystems/%s" % (self.configfs_dir, nqn)
+        self._path = "%s/subsystems/%s" % (self.nvmet_prefix, nqn)
         self._create_in_cfs(mode)
 
     def _generate_nqn(self):
@@ -456,15 +425,14 @@ class Subsystem(CFSNode):
 
     def _list_namespaces(self):
         self._check_self()
-        for d in os.listdir("%s/namespaces/" % self._path):
+        for d in self.cfg.namelist(self._path, 'namespaces'):
             yield Namespace(self, int(d), 'lookup')
 
     namespaces = property(_list_namespaces,
                           doc="Get the list of Namespaces for the Subsystem.")
 
     def _list_allowed_hosts(self):
-        return [os.path.basename(name)
-                for name in os.listdir("%s/allowed_hosts/" % self._path)]
+        return self.cfg.fetch_list(self._path, 'allowed_hosts')
 
     allowed_hosts = property(_list_allowed_hosts,
                              doc="Get the list of Allowed Hosts for the Subsystem.")
@@ -473,20 +441,21 @@ class Subsystem(CFSNode):
         '''
         Enable access for the host identified by I{nqn} to the Subsystem
         '''
+        src = f'{self.nvmet_prefix}/hosts/{nqn}'
+        dst = f'{self._path}/allowed_hosts/{nqn}'
         try:
-            os.symlink("%s/hosts/%s" % (self.configfs_dir, nqn),
-                       "%s/allowed_hosts/%s" % (self._path, nqn))
+            self.cfg.link(src, dst)
         except Exception as e:
-            raise CFSError("Could not symlink %s in configFS: %s" % (nqn, e))
+            raise CFSError(f'Could not enable access from {src} to {dst}: {e}')
 
     def remove_allowed_host(self, nqn):
         '''
         Disable access for the host identified by I{nqn} to the Subsystem
         '''
         try:
-            os.unlink("%s/allowed_hosts/%s" % (self._path, nqn))
+            self.cfg.unlink(f'{self._path}/allowed_hosts/{nqn}')
         except Exception as e:
-            raise CFSError("Could not unlink %s in configFS: %s" % (nqn, e))
+            raise CFSError("Could not disable access to %s: %s" % (nqn, e))
 
     @classmethod
     def setup(cls, t, err_func):
@@ -523,7 +492,7 @@ class Subsystem(CFSNode):
 
 class Namespace(CFSNode):
     '''
-    This is an interface to a NVMe Namespace in configFS.
+    This is an interface to a NVMe Namespace.
     A Namespace is identified by its parent Subsystem and Namespace ID.
     '''
 
@@ -539,10 +508,10 @@ class Namespace(CFSNode):
             If no nsid is specified, the next free one will be used.
         @type nsid: int
         @param mode:An optional string containing the object creation mode:
-            - I{'any'} means the configFS object will be either looked up
+            - I{'any'} means the object will be either looked up
               or created.
-            - I{'lookup'} means the object MUST already exist configFS.
-            - I{'create'} means the object must NOT already exist in configFS.
+            - I{'lookup'} means the object MUST already exist.
+            - I{'create'} means the object must NOT already exist.
         @type mode:string
         @return: A Namespace object.
         '''
@@ -570,7 +539,7 @@ class Namespace(CFSNode):
         self.attr_groups = ['device', 'ana']
         self._subsystem = subsystem
         self._nsid = nsid
-        self._path = "%s/namespaces/%d" % (self.subsystem.path, self.nsid)
+        self._path = "%s/namespaces/%d" % (self.subsystem._path, self.nsid)
         self._create_in_cfs(mode)
 
     def _get_subsystem(self):
@@ -582,18 +551,15 @@ class Namespace(CFSNode):
     def _get_grpid(self):
         self._check_self()
         _grpid = 0
-        path = "%s/ana_grpid" % self.path
-        if os.path.isfile(path):
-            with open(path, 'r') as file_fd:
-                _grpid = int(file_fd.read().strip())
+        path = "%s/ana_grpid" % self._path
+        if self.cfg.test_attr(path):
+            _grpid = int(self.cfg.fetch(path))
         return _grpid
 
     def set_grpid(self, grpid):
         self._check_self()
         path = "%s/ana_grpid" % self.path
-        if os.path.isfile(path):
-            with open(path, 'w') as file_fd:
-                file_fd.write(str(grpid))
+        self.cfg.modify(path, str(grpid))
 
     grpid = property(_get_grpid, doc="Get the ANA Group ID.")
 
@@ -620,19 +586,16 @@ class Namespace(CFSNode):
             return
 
         ns._setup_attrs(n, err_func)
-        if 'ana_grpid' in n:
-            ns.set_grpid(int(n['ana_grpid']))
 
     def dump(self):
         d = super(Namespace, self).dump()
         d['nsid'] = self.nsid
-        d['ana_grpid'] = self.grpid
         return d
 
 
 class Port(CFSNode):
     '''
-    This is an interface to a NVMe Port in configFS.
+    This is an interface to a NVMe Port.
     '''
 
     MAX_PORTID = 8192
@@ -645,7 +608,7 @@ class Port(CFSNode):
 
         self.attr_groups = ['addr', 'param']
         self._portid = int(portid)
-        self._path = "%s/ports/%d" % (self.configfs_dir, self._portid)
+        self._path = "%s/ports/%d" % (self.nvmet_prefix, self._portid)
         self._create_in_cfs(mode)
 
     def _get_portid(self):
@@ -654,8 +617,7 @@ class Port(CFSNode):
     portid = property(_get_portid, doc="Get the Port ID as an int.")
 
     def _list_subsystems(self):
-        return [os.path.basename(name)
-                for name in os.listdir("%s/subsystems/" % self._path)]
+        return self.cfg.fetch_list(self._path, 'subsystems')
 
     subsystems = property(_list_subsystems,
                           doc="Get the list of Subsystem for this Port.")
@@ -665,19 +627,19 @@ class Port(CFSNode):
         Enable access to the Subsystem identified by I{nqn} through this Port.
         '''
         try:
-            os.symlink("%s/subsystems/%s" % (self.configfs_dir, nqn),
-                       "%s/subsystems/%s" % (self._path, nqn))
+            self.cfg.link(f'{self.nvmet_prefix}/subsystems/{nqn}',
+                          f'{self._path}/subsystems/{nqn}')
         except Exception as e:
-            raise CFSError("Could not symlink %s in configFS: %s" % (nqn, e))
+            raise CFSError("Could not enable access to %s: %s" % (nqn, e))
 
     def remove_subsystem(self, nqn):
         '''
         Disable access to the Subsystem identified by I{nqn} through this Port.
         '''
         try:
-            os.unlink("%s/subsystems/%s" % (self._path, nqn))
+            self.cfg.unlink("%s/subsystems/%s" % (self._path, nqn))
         except Exception as e:
-            raise CFSError("Could not unlink %s in configFS: %s" % (nqn, e))
+            raise CFSError("Could not disable access to %s: %s" % (nqn, e))
 
     def delete(self):
         '''
@@ -694,7 +656,7 @@ class Port(CFSNode):
 
     def _list_referrals(self):
         self._check_self()
-        for d in os.listdir("%s/referrals/" % self._path):
+        for d in self.cfg.namelist(self._path, 'referrals'):
             yield Referral(self, d, 'lookup')
 
     referrals = property(_list_referrals,
@@ -702,8 +664,8 @@ class Port(CFSNode):
 
     def _list_ana_groups(self):
         self._check_self()
-        if os.path.isdir("%s/ana_groups/" % self._path):
-            for d in os.listdir("%s/ana_groups/" % self._path):
+        if self.cfg.test("%s/ana_groups" % self._path):
+            for d in self.cfg.namelist(self._path, 'ana_groups'):
                 yield ANAGroup(self, int(d), 'lookup')
 
     ana_groups = property(_list_ana_groups,
@@ -746,7 +708,7 @@ class Port(CFSNode):
 
 class Referral(CFSNode):
     '''
-    This is an interface to a NVMe Referral in configFS.
+    This is an interface to a NVMe Referral.
     '''
 
     def __repr__(self):
@@ -761,7 +723,7 @@ class Referral(CFSNode):
         self.attr_groups = ['addr']
         self.port = port
         self._name = name
-        self._path = "%s/referrals/%s" % (self.port.path, self._name)
+        self._path = "%s/referrals/%s" % (self.port._path, self._name)
         self._create_in_cfs(mode)
 
     def _get_name(self):
@@ -797,7 +759,7 @@ class Referral(CFSNode):
 
 class ANAGroup(CFSNode):
     '''
-    This is an interface to a NVMe ANA Group in configFS.
+    This is an interface to a NVMe ANA Group.
     '''
 
     MAX_GRPID = 1024
@@ -808,7 +770,7 @@ class ANAGroup(CFSNode):
     def __init__(self, port, grpid, mode='any'):
         super(ANAGroup, self).__init__()
 
-        if not os.path.isdir("%s/ana_groups" % port.path):
+        if not self.cfg.test("%s/ana_groups" % port._path):
             raise CFSError("ANA not supported")
 
         if grpid is None:
@@ -830,7 +792,7 @@ class ANAGroup(CFSNode):
         self.attr_groups = ['ana']
         self._port = port
         self._grpid = grpid
-        self._path = "%s/ana_groups/%d" % (self._port.path, self.grpid)
+        self._path = "%s/ana_groups/%d" % (self._port._path, self.grpid)
         self._create_in_cfs(mode)
 
     def _get_grpid(self):
@@ -871,7 +833,7 @@ class ANAGroup(CFSNode):
 
 class Host(CFSNode):
     '''
-    This is an interface to a NVMe Host in configFS.
+    This is an interface to a NVMe Host.
     A Host is identified by its NQN.
     '''
 
@@ -883,17 +845,17 @@ class Host(CFSNode):
         @param nqn: The Hosts's NQN.
         @type nqn: string
         @param mode:An optional string containing the object creation mode:
-            - I{'any'} means the configFS object will be either looked up
+            - I{'any'} means the object will be either looked up
               or created.
-            - I{'lookup'} means the object MUST already exist configFS.
-            - I{'create'} means the object must NOT already exist in configFS.
+            - I{'lookup'} means the object MUST already exist.
+            - I{'create'} means the object must NOT already exist.
         @type mode:string
         @return: A Host object.
         '''
         super(Host, self).__init__()
 
         self.nqn = nqn
-        self._path = "%s/hosts/%s" % (self.configfs_dir, nqn)
+        self._path = "%s/hosts/%s" % (self.nvmet_prefix, nqn)
         self._create_in_cfs(mode)
 
     @classmethod
